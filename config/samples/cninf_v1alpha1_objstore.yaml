@@ -1,0 +1,13 @@
+apiVersion: cninf.ops.narenvadapalli.com/v1alpha1
+kind: ObjStore
+metadata:
+  labels:
+    app.kubernetes.io/name: objstore
+    app.kubernetes.io/instance: objstore-sample
+    app.kubernetes.io/part-of: cninf
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: cninf
+  name: naren-learn-ops-01
+spec:
+  name: naren-learn-extk8s-01
+  locked: false
