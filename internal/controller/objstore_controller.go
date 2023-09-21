@@ -18,6 +18,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -27,15 +33,22 @@ import (
 	cninfv1alpha1 "github.com/narenandu/kubernetes-extensions/cninf/api/v1alpha1"
 )
 
+const (
+	configMapName = "%s-cm"
+	finalizer     = "objstores.learn.narenvadapalli.com/finalizer"
+)
+
 // ObjStoreReconciler reconciles a ObjStore object
 type ObjStoreReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	S3svc  *s3.S3
 }
 
 //+kubebuilder:rbac:groups=cninf.ops.narenvadapalli.com,resources=objstores,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=cninf.ops.narenvadapalli.com,resources=objstores/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=cninf.ops.narenvadapalli.com,resources=objstores/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;create;update;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -51,12 +64,38 @@ func (r *ObjStoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	instance := &cninfv1alpha1.ObjStore{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
-		log.Error(err, "unable to get resource")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if instance.Status.State == "" {
-		instance.Status.State = cninfv1alpha1.PENDING_STATE
-		r.Status().Update(ctx, instance)
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		if instance.Status.State == "" {
+			instance.Status.State = cninfv1alpha1.PENDING_STATE
+			r.Status().Update(ctx, instance)
+		}
+		controllerutil.AddFinalizer(instance, finalizer)
+		if err := r.Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		if instance.Status.State == cninfv1alpha1.PENDING_STATE {
+			log.Info("stating to create resources")
+			if err := r.createResources(ctx, instance); err != nil {
+				instance.Status.State = cninfv1alpha1.ERROR_STATE
+				r.Status().Update(ctx, instance)
+				log.Error(err, "error creating bucket")
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		log.Info("deletion flow")
+		if err := r.deleteResources(ctx, instance); err != nil {
+			instance.Status.State = cninfv1alpha1.ERROR_STATE
+			r.Status().Update(ctx, instance)
+			log.Error(err, "error deleting bucket")
+			return ctrl.Result{}, err
+		}
+		controllerutil.RemoveFinalizer(instance, finalizer)
+		if err := r.Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// TODO(user): your logic here
@@ -69,4 +108,73 @@ func (r *ObjStoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cninfv1alpha1.ObjStore{}).
 		Complete(r)
+}
+
+func (r *ObjStoreReconciler) createResources(ctx context.Context, objStore *cninfv1alpha1.ObjStore) error {
+	//update the status first
+	objStore.Status.State = cninfv1alpha1.CREATING_STATE
+	err := r.Status().Update(ctx, objStore)
+	if err != nil {
+		return err
+	}
+	//create the bucket
+	b, err := r.S3svc.CreateBucket(&s3.CreateBucketInput{
+		Bucket:                     aws.String(objStore.Spec.Name),
+		ObjectLockEnabledForBucket: aws.Bool(objStore.Spec.Locked),
+	})
+	if err != nil {
+		return err
+	}
+	//wait for it to be created
+	err = r.S3svc.WaitUntilBucketExists(&s3.HeadBucketInput{Bucket: aws.String(objStore.Spec.Name)})
+	if err != nil {
+		return err
+	}
+	//now create the configmap
+	data := make(map[string]string, 0)
+	data["bucketName"] = objStore.Spec.Name
+	data["location"] = *b.Location
+	configmap := &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf(configMapName, objStore.Spec.Name),
+			Namespace: objStore.Namespace,
+		},
+		Data: data,
+	}
+	err = r.Create(ctx, configmap)
+	if err != nil {
+		return err
+	}
+	objStore.Status.State = cninfv1alpha1.CREATED_STATE
+	err = r.Status().Update(ctx, objStore)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *ObjStoreReconciler) deleteResources(ctx context.Context, objStore *cninfv1alpha1.ObjStore) error {
+	//delete the bucket first
+	_, err := r.S3svc.DeleteBucket(&s3.DeleteBucketInput{Bucket: aws.String(objStore.Spec.Name)})
+	if err != nil {
+		return err
+	}
+	//Now delete the config map
+	configmap := &v1.ConfigMap{}
+	err = r.Get(ctx, client.ObjectKey{
+		Name:      fmt.Sprintf(configMapName, objStore.Spec.Name),
+		Namespace: objStore.Namespace,
+	}, configmap)
+	if err != nil {
+		return err
+	}
+	err = r.Delete(ctx, configmap)
+	if err != nil {
+		return err
+	}
+	return nil
 }

@@ -14,11 +14,7 @@ spec:
     singular: objstore
   scope: Namespaced
   versions:
-  - additionalPrinterColumns:
-    - jsonPath: .status.state
-      name: State
-      type: string
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ObjStore is the Schema for the objstores API
